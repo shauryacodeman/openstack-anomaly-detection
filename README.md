@@ -23,3 +23,42 @@ System logs contain two critical dimensions of information: *what* happened (tem
 ├── train.py               # Training loop with chronological historical split
 ├── evaluate.py            # Holdout evaluation script for Precision, Recall, and F1
 └── requirements.txt       # Python dependencies
+```
+
+## ⚙️ Installation & Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone [https://github.com/shauryacodeman/openstack-anomaly-detection.git](https://github.com/shauryacodeman/openstack-anomaly-detection.git)
+   cd openstack-anomaly-detection
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Download the Dataset:**
+   * Download the OpenStack log dataset from [Loghub (Logpai)](https://github.com/logpai/loghub).
+   * Create a directory named `loghub/OpenStack/` in the root of this repository.
+   * Place `openstack_normal1.log`, `openstack_normal2.log`, and `openstack_abnormal.log` into this folder.
+
+## 🧠 Usage
+
+**1. Train the Model**
+Run the training script to ingest the logs, parse them via Regex, train the hybrid neural network on the first 80% of the chronological timeline, and save the weights.
+```bash
+python train.py
+```
+*Outputs:* `openstack_checkpoint.pth`
+
+**2. Evaluate Performance**
+Run the evaluation script to test the model against the full timeline and generate the final confusion matrix, Precision, Recall, and F1-score metrics.
+```bash
+python evaluate.py
+```
+
+## 👨‍💻 Author
+**Shaurya Pradhan**  
+Information Technology B.Tech  
+[GitHub Profile](https://github.com/shauryacodeman)
