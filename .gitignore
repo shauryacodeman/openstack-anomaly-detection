@@ -1,3 +1,15 @@
 loghub/
+/data/rcaeval/*
+!/data/rcaeval/LICENSE
+!/data/rcaeval/README.md
+!/data/rcaeval/re3ob_*/
+/data/rcaeval/re3ob_*/*
+!/data/rcaeval/re3ob_*/inject_time.txt
+!/data/rcaeval/re3ob_*/logs.parquet
+!/data/rcaeval/re3ob_*/traces.parquet
+.venv/
+.venv-cuda/
 __pycache__/
 *.pth
+/experiment*.log
+/cuda-setup.log

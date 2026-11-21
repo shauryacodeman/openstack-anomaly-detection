@@ -1,80 +1,60 @@
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Subset , random_split
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 
-from dataset_builder import load_raw_logs, parse_openstack_logs, generate_windows
-from openstack_dataset import OpenStackDataset
-from anomaly_detector import MultiSourceAnomalyDetector
+from anomaly_detector import MODEL_NAMES, MultiSourceAnomalyDetector
+from openstack_dataset import WindowDataset
 from tokenizer import LogTokenizer
+from train import CHECKPOINTS, anomaly_scores, dataset_argument, load_windows
 
-def evaluate_model():
-    print("1. Rebuilding pipeline for evaluation...")
-    raw_logs = load_raw_logs("./loghub/OpenStack")
-    df = parse_openstack_logs(raw_logs)
-    windows = generate_windows(df)
-    
-    with open("./loghub/OpenStack/anomaly_labels.txt", 'r') as f:
-        # Strip the 'req-' prefix so the labels match our Regex parsed session_ids
-        anomalous_sessions = {line.strip().replace("req-", "") for line in f.readlines() if line.strip()}
-        
-    print(f"Loaded {len(anomalous_sessions)} known anomalous sessions from ground truth.")
-        
-    tokenizer = LogTokenizer(seq_len=10)
-    tokenizer.fit(df)
-    
-    dataset = OpenStackDataset(windows, tokenizer, anomalous_sessions)
-    
-    # ... [Keep your imports and data loading] ...
-    dataset = OpenStackDataset(windows, tokenizer, anomalous_sessions)
-    
-    # --- FULL DATASET AUDIT ---
-    # Evaluate the entire timeline to view the true confusion matrix
-    eval_dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
-    
-    print(f"2. Initializing model for evaluation on all {len(dataset)} windows...")
-    model = MultiSourceAnomalyDetector()
-    embedding_layer = nn.Embedding(num_embeddings=tokenizer.idx, embedding_dim=128)
-    
-    # Load the trained weights
-    checkpoint = torch.load("openstack_checkpoint.pth")
-    model.load_state_dict(checkpoint['model_state'])
-    embedding_layer.load_state_dict(checkpoint['embed_state'])
-    
-    model.eval()
-    embedding_layer.eval()
-    
-    all_preds = []
-    all_labels = []
-    
-    print("3. Running predictions...")
-    with torch.no_grad():
-        for traces, logs, labels in eval_dataloader: # Pass full eval_dataloader
-            logs_embedded = embedding_layer(logs)
-            outputs = model(traces, logs_embedded)
-            
-            _, predicted = torch.max(outputs.data, 1)
-            all_preds.append(predicted.item())
-            all_labels.append(labels.item())
-            
-    # ... [Keep your sklearn metrics code at the bottom] ...
-            
-    # Compute paper metrics
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
-    conf_matrix = confusion_matrix(all_labels, all_preds)
-    
-    print("\n=== FINAL EVALUATION METRICS ===")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall:    {recall:.4f}")
-    print(f"F1-Score:  {f1:.4f}")
-    print("\nConfusion Matrix:")
-    if conf_matrix.shape == (2, 2):
-        print(f"True Normal: {conf_matrix[0][0]}    | False Positive: {conf_matrix[0][1]}")
-        print(f"False Negative: {conf_matrix[1][0]} | True Anomalous: {conf_matrix[1][1]}")
-    else:
-        print(conf_matrix)
+
+def score_predictions(labels, predictions):
+    # Encode (actual, predicted) as 0 for true negatives, 1 for false positives, 2 for misses and 3 for hits.
+    tn, fp, fn, tp = (2 * labels + predictions).bincount(minlength=4).tolist()
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * tp / max(2 * tp + fp + fn, 1)
+    return tp, fn, fp, tn, precision, recall, f1
+
+
+@torch.inference_mode()
+def evaluate_model(dataset_name="openstack"):
+    torch.set_num_threads(2)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Testing device: {torch.cuda.get_device_name() if device.type == 'cuda' else 'CPU'}")
+    checkpoint = torch.load(CHECKPOINTS[dataset_name], map_location="cpu", weights_only=True)
+    tokenizer = LogTokenizer(seq_len=checkpoint["sequence_length"])
+    tokenizer.template_to_id = checkpoint["templates"]
+
+    _, test_windows = load_windows(dataset_name)
+    dataset = WindowDataset(test_windows, tokenizer, checkpoint["nodes"])
+    if checkpoint.get("trace_reference") is not None:
+        dataset.apply_trace_reference(checkpoint["trace_reference"])
+    normal, anomalous = dataset.labels.bincount(minlength=2).tolist()
+    if not normal or not anomalous:
+        raise ValueError("Testing needs both normal and anomalous windows.")
+    print(f"Test set: {normal} normal and {anomalous} anomalous windows.")
+
+    prediction_rows = []
+    for mode, name in MODEL_NAMES.items():
+        print(f"Testing: {name}")
+        model = MultiSourceAnomalyDetector(
+            mode=mode, vocab_size=tokenizer.idx, trace_channels=checkpoint.get("trace_channels", 1)
+        ).to(device)
+        model.load_state_dict(checkpoint["models"][mode])
+        scores = anomaly_scores(model, dataset, device)
+        threshold = checkpoint.get("thresholds", {}).get(mode)
+        if threshold is None:
+            predictions = scores.gt(0.5).long()
+        else:
+            print(f"  Validation cutoff: {threshold:.3f}")
+            predictions = scores.ge(threshold).long()
+        prediction_rows.append((name, predictions))
+
+    print("\nHeld-out test results (counts are windows)")
+    print(f"{'Model':<26} {'Caught':>6} {'Missed':>6} {'False alarms':>12} {'Correct normal':>14} {'Precision':>10} {'Recall':>7} {'F1':>7}")
+    for name, predictions in prediction_rows:
+        tp, fn, fp, tn, precision, recall, f1 = score_predictions(dataset.labels, predictions)
+        print(f"{name:<26} {tp:>6} {fn:>6} {fp:>12} {tn:>14} {precision:>10.3f} {recall:>7.3f} {f1:>7.3f}")
+
 
 if __name__ == "__main__":
-    evaluate_model()
+    evaluate_model(dataset_argument())

@@ -2,13 +2,23 @@ import pandas as pd
 import numpy as np
 import torch
 
-def generate_trace_matrix(trace_df):
-    # 1. Extract unique nodes to determine K (matrix size)
-    nodes = pd.concat([trace_df['source'], trace_df['destination']]).unique()
-    K = len(nodes)
-    
-    # Create a mapping from node name to matrix index (0 to K-1)
-    node_to_index = {node: i for i, node in enumerate(nodes)}
+def generate_trace_matrix(trace_df, node_to_index=None):
+    if node_to_index is None:
+        nodes = pd.concat([trace_df["source"], trace_df["destination"]]).unique()
+        node_to_index = {node: i for i, node in enumerate(nodes)}
+    K = len(node_to_index)
+
+    if "latency_ms" in trace_df:
+        calls = trace_df.groupby(["source", "destination"]).agg(
+            count=("latency_ms", "size"), latency=("latency_ms", "mean"), error=("error", "mean")
+        ).fillna(0)
+        # Use a fixed log scale for counts and latency so magnitude is comparable across windows.
+        calls[["count", "latency"]] = np.log1p(calls[["count", "latency"]]) / 10
+        features = np.zeros((3, K, K), dtype=np.float32)
+        for (source, destination), values in calls.iterrows():
+            if source in node_to_index and destination in node_to_index:
+                features[:, node_to_index[source], node_to_index[destination]] = values.to_numpy(dtype=np.float32)
+        return torch.from_numpy(features), K, node_to_index
     
     # 2. Initialize an empty K x K matrix (using NumPy first for easy indexing)
     # The paper colors areas based on call rate, frequency, and delay. 
@@ -16,17 +26,17 @@ def generate_trace_matrix(trace_df):
     trace_matrix = np.zeros((K, K), dtype=np.float32)
     
     # 3. Aggregate the data (count total calls between each node pair)
-    call_counts = trace_df.groupby(['source', 'destination']).size().reset_index(name='count')
+    call_counts = trace_df.value_counts(["source", "destination"])
     
     # 4. Populate the matrix
-    for _, row in call_counts.iterrows():
-        src_idx = node_to_index[row['source']]
-        dst_idx = node_to_index[row['destination']]
-        trace_matrix[src_idx, dst_idx] = row['count']
+    for (source, destination), count in call_counts.items():
+        if source in node_to_index and destination in node_to_index:
+            trace_matrix[node_to_index[source], node_to_index[destination]] = count
         
     # Normalize the matrix to act like a grayscale image (values between 0 and 1)
-    if trace_matrix.max() > 0:
-        trace_matrix = trace_matrix / trace_matrix.max()
+    max_count = trace_matrix.max(initial=0)
+    if max_count > 0:
+        trace_matrix /= max_count
         
     # Convert to a PyTorch tensor with shape [Channels, Height, Width]
     # Since it's a 2D matrix, we add a channel dimension of 1.

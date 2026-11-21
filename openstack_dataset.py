@@ -1,45 +1,51 @@
+from dataclasses import dataclass
+
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
-import pandas as pd
+
 from trace_parser import generate_trace_matrix
 
-class OpenStackDataset(Dataset):
-    def __init__(self, windows_list, tokenizer, anomalous_sessions):
-        self.windows = windows_list
-        self.tokenizer = tokenizer
-        self.anomalous_sessions = anomalous_sessions
+
+@dataclass
+class TelemetryWindow:
+    events: pd.DataFrame
+    edges: pd.DataFrame
+    label: int
+    run_id: str | None = None
+
+
+class WindowDataset(Dataset):
+    def __init__(self, windows, tokenizer, node_to_index):
+        self.labels = torch.tensor([window.label for window in windows], dtype=torch.long)
+        self.traces = [generate_trace_matrix(window.edges, node_to_index)[0] for window in windows]
+        self.logs = [tokenizer.transform_window(window.events) for window in windows]
 
     def __len__(self):
-        return len(self.windows)
-
-    def _extract_trace_edges(self, window_df):
-        edges = []
-        for session, group in window_df.groupby('session_id'):
-            if pd.isna(session) or session in ['-', '']: continue
-            components = group['component'].tolist()
-            for i in range(len(components) - 1):
-                edges.append({'source': components[i], 'destination': components[i+1]})
-        
-        if not edges:
-            unique_comps = window_df['component'].unique()
-            edges = [{'source': c, 'destination': c} for c in unique_comps]
-            
-        return pd.DataFrame(edges)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        window_df = self.windows[idx]
-        
-        # 1. Real Spatial Trace Matrix
-        edges_df = self._extract_trace_edges(window_df)
-        trace_tensor, _, _ = generate_trace_matrix(edges_df)
-        
-        # 2. Real Temporal Log Sequence
-        log_sequence = self.tokenizer.transform_window(window_df)
-        
-        # 3. Real Label (Check if any session in this window is in the anomaly list)
-        window_sessions = set(window_df['session_id'].dropna().unique())
-        is_anomalous = bool(window_sessions.intersection(self.anomalous_sessions))
-        label = torch.tensor(1 if is_anomalous else 0, dtype=torch.long)
-        if is_anomalous:
-            print(f"  -> Window {idx} flagged as ANOMALOUS (Label 1)")
-        return trace_tensor, log_sequence, label
+        return self.traces[idx], self.logs[idx], self.labels[idx]
+
+    def healthy_trace_reference(self):
+        normal = torch.stack([trace for trace, label in zip(self.traces, self.labels) if label == 0])
+        return normal.mean(dim=0), normal.std(dim=0, unbiased=False).clamp_min(0.01)
+
+    def apply_trace_reference(self, reference):
+        mean, scale = reference
+        self.traces = [((trace - mean) / scale).clamp(-5, 5) for trace in self.traces]
+
+
+def openstack_examples(windows):
+    examples = []
+    for window in windows:
+        destination = window.groupby("session_id")["component"].shift(-1)
+        edges = pd.DataFrame({"source": window["component"], "destination": destination}).dropna()
+        label = int(window["fault_vm"].notna().any())
+        examples.append(TelemetryWindow(window, edges[edges["source"] != edges["destination"]], label))
+    return examples
+
+
+class OpenStackDataset(WindowDataset):
+    def __init__(self, windows, tokenizer, node_to_index):
+        super().__init__(openstack_examples(windows), tokenizer, node_to_index)

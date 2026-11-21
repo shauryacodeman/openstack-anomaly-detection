@@ -1,6 +1,12 @@
 import torch
 import torch.nn as nn
 
+MODEL_NAMES = {
+    "temporal": "Event order only",
+    "spatial": "Service transitions only",
+    "both": "Both together",
+}
+
 class SpatialAttention(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -30,32 +36,42 @@ class ATT_CNN(nn.Module):
         return torch.flatten(x, 1)
 
 class MultiSourceAnomalyDetector(nn.Module):
-    def __init__(self, seq_input_dim=128, lstm_hidden=64, cnn_out_dim=64):
+    def __init__(self, seq_input_dim=128, lstm_hidden=64, cnn_out_dim=64, *, mode="both",
+                 vocab_size=None, trace_channels=1):
         super().__init__()
-        self.att_cnn = ATT_CNN()
-        self.bi_lstm = nn.LSTM(seq_input_dim, lstm_hidden, bidirectional=True, batch_first=True)
-        
-        # Bi-LSTM outputs 2 * hidden_size (forward and backward directions)
-        combined_dim = cnn_out_dim + (lstm_hidden * 2)
-        
-        # Binary classification: 0 (Normal) or 1 (Anomalous)
-        self.fc = nn.Linear(combined_dim, 2) 
+        if mode not in MODEL_NAMES:
+            raise ValueError(f"Unknown model mode: {mode}")
+        self.att_cnn = None
+        self.bi_lstm = None
+        self.embedding = None
+        features = 0
+        if mode in ("spatial", "both"):
+            self.att_cnn = ATT_CNN(in_channels=trace_channels)
+            features += cnn_out_dim
+        if mode in ("temporal", "both"):
+            self.bi_lstm = nn.LSTM(seq_input_dim, lstm_hidden, bidirectional=True, batch_first=True)
+            if vocab_size is not None:
+                self.embedding = nn.Embedding(vocab_size, seq_input_dim, padding_idx=0)
+            features += lstm_hidden * 2
+        self.fc = nn.Linear(features, 2)
 
     def forward(self, trace_matrix, log_sequence):
-        # 1. Extract spatial features from the KxK trace matrix
-        cnn_features = self.att_cnn(trace_matrix)
-        
-        # 2. Extract temporal features from the log sequence
-        lstm_out, (hn, cn) = self.bi_lstm(log_sequence)
-        
-        # Get the final hidden state from both the forward and backward LSTM passes
-        lstm_features = torch.cat((hn[-2,:,:], hn[-1,:,:]), dim=1)
-        
-        # 3. Concatenate spatial and temporal features and classify
-        combined_features = torch.cat((cnn_features, lstm_features), dim=1)
-        logits = self.fc(combined_features)
-        
-        return logits
+        features = []
+        if self.att_cnn is not None:
+            features.append(self.att_cnn(trace_matrix))
+        if self.bi_lstm is not None:
+            valid_events = None
+            if self.embedding is not None:
+                valid_events = log_sequence.ne(0)
+                log_sequence = self.embedding(log_sequence)
+            event_features, _ = self.bi_lstm(log_sequence)
+            if valid_events is not None:
+                event_features = event_features.masked_fill(~valid_events.unsqueeze(-1), float("-inf"))
+            pooled = event_features.amax(dim=1)
+            if valid_events is not None:
+                pooled = pooled.masked_fill(~valid_events.any(dim=1, keepdim=True), 0)
+            features.append(pooled)
+        return self.fc(torch.cat(features, dim=1))
 
 if __name__ == "__main__":
     # --- Simulate a Forward Pass ---
